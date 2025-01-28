@@ -14,28 +14,27 @@ from telegram.ext import (
     ContextTypes
 )
 
-# --------------------------- CONFIG ---------------------------
+# -------------------------------------------------------------------
+# CONFIG
+# -------------------------------------------------------------------
 TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-
-# Use /api/generate on port 11434 (as requested)
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-
+OLLAMA_URL = "http://127.0.0.1:11434/api/generate"   # per your request
 MODEL_NAME = "deepseek-r1:8b"
 CONVERSATIONS_FILE = "conversations.json"
 
-# Toggle chain-of-thought
-SHOW_THINKING = True
-# --------------------------------------------------------------
+SHOW_THINKING = True  # Toggle chain-of-thought display
+
+# Telegram imposes ~4096 char limit for messages in most cases.
+MAX_TELEGRAM_MESSAGE_LENGTH = 4096
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 
-##############################################################################
-# DISK STORAGE (Conversation Histories)
-##############################################################################
-
+# -------------------------------------------------------------------
+# DISK STORAGE FOR CONVERSATIONS
+# -------------------------------------------------------------------
 conversations = {}
 
 def load_conversations():
@@ -54,41 +53,55 @@ def save_conversations():
     with open(CONVERSATIONS_FILE, "w", encoding="utf-8") as f:
         json.dump(conversations, f, ensure_ascii=False)
 
-##############################################################################
-# HELPER FUNCTIONS
-##############################################################################
 
+# -------------------------------------------------------------------
+# MARKDOWN V2 ESCAPING AND CHUNKING
+# -------------------------------------------------------------------
 def escape_markdown_v2(text: str) -> str:
     """
     Escapes Telegram MarkdownV2 special characters:
     '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!'
-    so we can safely use spoilers and other formatting.
     """
-    # Characters that must be escaped in MarkdownV2
     escape_chars = r'_*[]()~`>#+-=|{}.!'
     for c in escape_chars:
-        text = text.replace(c, '\\' + c)
+        text = text.replace(c, f"\\{c}")
     return text
 
-def extract_think_sections(text):
+def chunk_text(text: str, max_length: int = MAX_TELEGRAM_MESSAGE_LENGTH):
     """
-    Parse out <think>...</think> blocks from accumulated text.
+    Splits a (possibly very long) string into a list of chunks
+    each up to 'max_length' characters.
+    """
+    lines = []
+    start = 0
+    while start < len(text):
+        end = start + max_length
+        lines.append(text[start:end])
+        start = end
+    return lines
+
+
+# -------------------------------------------------------------------
+# HELPER: EXTRACT <think> TAGS
+# -------------------------------------------------------------------
+def extract_think_sections(text: str):
+    """
+    Finds <think>...</think> blocks in 'text' and removes them.
     Returns (thinking_text, public_text):
-      - thinking_text: concatenation of fully closed <think> blocks
-      - public_text: same text but with those blocks removed
+      - thinking_text: all fully matched <think> blocks combined
+      - public_text: 'text' with those <think> blocks removed
     """
     pattern = r"<think>(.*?)</think>"
     matches = re.findall(pattern, text, flags=re.DOTALL)
-
     thinking_text = "\n\n".join(m.strip() for m in matches)
     public_text = re.sub(pattern, "", text, flags=re.DOTALL).strip()
 
     return thinking_text, public_text
 
-##############################################################################
-# BOT COMMANDS
-##############################################################################
 
+# -------------------------------------------------------------------
+# BOT COMMANDS
+# -------------------------------------------------------------------
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = str(update.effective_chat.id)
     conversations[chat_id] = []
@@ -110,17 +123,20 @@ async def toggle_thinking_command(update: Update, context: ContextTypes.DEFAULT_
     status = "ON" if SHOW_THINKING else "OFF"
     await update.message.reply_text(f"SHOW_THINKING is now {status}.")
 
-##############################################################################
-# MAIN MESSAGE HANDLER
-##############################################################################
 
+# -------------------------------------------------------------------
+# MAIN MESSAGE HANDLER
+# -------------------------------------------------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    If SHOW_THINKING=True -> exactly 3 messages:
-      1) "Thinking:"
-      2) chain-of-thought in spoilers, updated in real-time
-      3) user-facing text, updated in real-time
-    If SHOW_THINKING=False -> one streaming message with user-facing text
+    If SHOW_THINKING=True -> 3 messages total:
+      1) "Thinking:" (static)
+      2) chain-of-thought in spoilers (MarkdownV2), updated partial
+      3) user-facing text, updated partial
+      Then chunk final texts if > 4096 chars.
+
+    If SHOW_THINKING=False -> one streamed message with user-facing text,
+      chunk final if > 4096.
     """
     chat_id = str(update.effective_chat.id)
     user_text = update.message.text
@@ -129,7 +145,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conversation = conversations.get(chat_id, [])
     conversation.append({"role": "user", "content": user_text})
 
-    # Build prompt from conversation so far
+    # Build prompt from entire conversation
     prompt_text = "You are a helpful assistant.\n"
     for turn in conversation:
         if turn["role"] == "user":
@@ -138,44 +154,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             prompt_text += f"Assistant: {turn['content']}\n"
     prompt_text += "Assistant:"
 
+    # We'll accumulate partial tokens in this string
     raw_accumulated = ""
 
+    # Prepare messages depending on SHOW_THINKING
     if SHOW_THINKING:
-        # Message #1: "Thinking:" (static)
+        # 1) "Thinking:"
         await update.message.reply_text("Thinking:")
 
-        # Message #2: chain-of-thought spoilers
+        # 2) chain-of-thought in spoilers
         chain_of_thought_msg = await update.effective_chat.send_message(
             text="(chain-of-thought spoilers here)",
             parse_mode="MarkdownV2"
         )
 
-        # Message #3: public text
+        # 3) public text
         public_msg = await update.effective_chat.send_message(
             text="(final answer will appear here)"
         )
     else:
-        # Only one streaming message
+        # Single message for user-facing text
         single_msg = await update.message.reply_text("(Generating...)")
 
+    # We'll stream from Ollama
     payload = {
         "prompt": prompt_text,
         "model": MODEL_NAME,
         "stream": True
     }
-
     last_update_time = time.time()
 
     try:
         with requests.post(OLLAMA_URL, json=payload, stream=True) as response:
             if response.status_code != 200:
-                error_text = f"Error {response.status_code} from Ollama:\n{response.text}"
+                err_text = f"Error {response.status_code} from Ollama:\n{response.text}"
                 if SHOW_THINKING:
-                    await chain_of_thought_msg.edit_text(error_text)
+                    await chain_of_thought_msg.edit_text(err_text)
                 else:
-                    await single_msg.edit_text(error_text)
+                    await single_msg.edit_text(err_text)
                 return
 
+            # Partial token streaming
             for line in response.iter_lines(decode_unicode=True):
                 if not line.strip():
                     continue
@@ -188,29 +207,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if "response" in chunk:
                     raw_accumulated += chunk["response"]
 
-                    # Separate chain-of-thought vs. public
+                    # Extract chain-of-thought vs public
                     thinking_text, public_text = extract_think_sections(raw_accumulated)
 
-                    # Limit how often we edit messages to avoid spam/rate limits
+                    # Throttle updates to avoid spamming
                     if time.time() - last_update_time > 0.7:
                         if SHOW_THINKING:
-                            # Format chain-of-thought in MarkdownV2 spoilers
-                            # e.g. ||some chain-of-thought|| + escaped
-                            safe_thinking = escape_markdown_v2(thinking_text) if thinking_text else ""
-                            spoiler_text = f"||{safe_thinking}||" if safe_thinking else "|| (nothing yet) ||"
-
+                            # Update chain-of-thought in spoilers
+                            spoiler_raw = escape_markdown_v2(thinking_text) or "(no thinking yet)"
+                            spoiler_text = f"||{spoiler_raw}||"
                             try:
                                 await chain_of_thought_msg.edit_text(spoiler_text, parse_mode="MarkdownV2")
                             except:
                                 pass
 
-                            # Update public text (no special parse mode needed if not using Markdown)
+                            # Update public text
                             try:
                                 await public_msg.edit_text(public_text if public_text else "(no public text yet)")
                             except:
                                 pass
                         else:
-                            # If thinking is off, just show user-facing text
+                            # Show only public text
                             try:
                                 await single_msg.edit_text(public_text if public_text else "(still thinking...)")
                             except:
@@ -218,29 +235,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                         last_update_time = time.time()
 
-            # Final update after streaming ends
+            # Final parse after streaming completes
             thinking_text, public_text = extract_think_sections(raw_accumulated)
-
-            if SHOW_THINKING:
-                # Final chain-of-thought update
-                safe_thinking = escape_markdown_v2(thinking_text) if thinking_text else ""
-                spoiler_text = f"||{safe_thinking}||" if safe_thinking else "|| (nothing) ||"
-                try:
-                    await chain_of_thought_msg.edit_text(spoiler_text, parse_mode="MarkdownV2")
-                except:
-                    pass
-
-                # Final public text
-                try:
-                    await public_msg.edit_text(public_text if public_text else "(no text)")
-                except:
-                    pass
-            else:
-                # Single final text
-                try:
-                    await single_msg.edit_text(public_text if public_text else "(no text)")
-                except:
-                    pass
 
     except requests.exceptions.RequestException as e:
         err_msg = f"Error connecting to Ollama:\n{e}"
@@ -250,15 +246,73 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await single_msg.edit_text(err_msg)
         return
 
-    # Save user-facing text in conversation
+    # ----------------------------------------------------------------
+    # CHUNK & SEND (OR EDIT) FINAL TEXTS IF OVER TELEGRAM LIMIT
+    # ----------------------------------------------------------------
+    if SHOW_THINKING:
+        # Final chain-of-thought
+        spoiler_raw = escape_markdown_v2(thinking_text) or "(nothing)"
+        spoiler_text = f"||{spoiler_raw}||"
+
+        # Let's try to "edit" the final chain_of_thought_msg if under limit
+        # If it's over, we'll send multiple messages
+        chunks = chunk_text(spoiler_text)
+        if len(chunks) == 1:
+            # Fits in one message
+            try:
+                await chain_of_thought_msg.edit_text(chunks[0], parse_mode="MarkdownV2")
+            except:
+                pass
+        else:
+            # It's too big - let's edit the first message with a note, then send the rest
+            try:
+                await chain_of_thought_msg.edit_text("(chain-of-thought too large, splitting...)")
+            except:
+                pass
+            for c in chunks:
+                await update.effective_chat.send_message(c, parse_mode="MarkdownV2")
+
+        # Final public text
+        public_chunks = chunk_text(public_text)
+        if len(public_chunks) == 1:
+            try:
+                await public_msg.edit_text(public_chunks[0] if public_chunks[0] else "(no text)")
+            except:
+                pass
+        else:
+            # Edit the original to show first chunk or note
+            try:
+                await public_msg.edit_text("(answer too large, splitting...)")
+            except:
+                pass
+            for c in public_chunks:
+                await update.effective_chat.send_message(c if c else "(empty)")
+    else:
+        # Single final text
+        public_chunks = chunk_text(public_text)
+        if len(public_chunks) == 1:
+            try:
+                await single_msg.edit_text(public_chunks[0] if public_chunks[0] else "(no text)")
+            except:
+                pass
+        else:
+            # It's bigger than 4096, so we must split into multiple messages
+            try:
+                await single_msg.edit_text("(answer too large, splitting...)")
+            except:
+                pass
+            for c in public_chunks:
+                await update.effective_chat.send_message(c if c else "(empty)")
+
+    # Save final user-facing text to conversation
     conversation.append({"role": "assistant", "content": public_text})
     conversations[chat_id] = conversation
     save_conversations()
 
-##############################################################################
-# MAIN
-##############################################################################
 
+# -------------------------------------------------------------------
+# MAIN
+# -------------------------------------------------------------------
 if __name__ == "__main__":
     load_conversations()
 
