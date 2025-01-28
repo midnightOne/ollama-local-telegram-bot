@@ -22,6 +22,7 @@ OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
 
 MODEL_NAME = "deepseek-r1:8b"
 CONVERSATIONS_FILE = "conversations.json"
+MAX_CONVERSATION_TURNS = 10
 
 # Telegram’s nominal max message length
 TELEGRAM_MAX_LEN = 4096
@@ -34,34 +35,109 @@ logging.basicConfig(
 # We’ll store conversation history in JSON on disk
 conversations = {}
 
+def debug_conversation_structure(chat_id):
+    """Helper function to debug conversation structure"""
+    if chat_id not in conversations:
+        logging.info(f"No conversation found for chat_id {chat_id}")
+        return
+        
+    convo = conversations[chat_id]
+    logging.info(f"Conversation length: {len(convo)} turns")
+    
+    for i, turn in enumerate(convo):
+        role = turn.get("role", "MISSING_ROLE")
+        if role == "user":
+            logging.info(f"Turn {i}: User message")
+        elif role == "assistant":
+            has_thinking = bool(turn.get("thinking"))
+            has_content = bool(turn.get("content"))
+            logging.info(f"Turn {i}: Assistant response (thinking: {has_thinking}, content: {has_content})")
+        else:
+            logging.info(f"Turn {i}: Invalid role: {role}")
+
+def build_prompt(conversation):
+    """Build the prompt with clearer instructions about thinking tags"""
+    prompt_text = [
+        "You are a helpful assistant. Respond naturally to the user's messages.",
+        "Previous conversation:"
+    ]
+    
+    for turn in conversation:
+        if turn["role"] == "user":
+            prompt_text.append(f"User: {turn['content']}")
+        else:
+            # For assistant turns, reconstruct with thinking tags if present
+            thinking = turn.get("thinking", "").strip()
+            response = turn.get("content", "").strip()
+            
+            if thinking and response:
+                prompt_text.append(f"Assistant: <think>{thinking}</think>\n{response}")
+            elif thinking:
+                prompt_text.append(f"Assistant: <think>{thinking}</think>")
+            else:
+                prompt_text.append(f"Assistant: {response}")
+    
+    prompt_text.append("Assistant:")
+    return "\n".join(prompt_text)
+
+def trim_conversation(conversation, max_turns=MAX_CONVERSATION_TURNS):
+    """
+    Keep only the last N turns while ensuring we don't break in the middle of a turn.
+    A turn consists of a user message and the assistant's response.
+    """
+    if len(conversation) <= max_turns * 2:
+        return conversation
+        
+    # Ensure we start with a user message when trimming
+    start_idx = len(conversation) - (max_turns * 2)
+    while start_idx > 0 and conversation[start_idx]["role"] != "user":
+        start_idx -= 1
+        
+    return conversation[start_idx:]
+
 def load_conversations():
+    """Load conversations from disk with validation"""
     global conversations
     if os.path.exists(CONVERSATIONS_FILE):
         try:
             with open(CONVERSATIONS_FILE, "r", encoding="utf-8") as f:
-                conversations = json.load(f)
-        except (json.JSONDecodeError, IOError):
-            logging.warning("Could not load conversations.json; starting fresh.")
+                loaded = json.load(f)
+                # Validate conversation structure with enhanced checks
+                for chat_id, convo in loaded.items():
+                    valid_convo = []
+                    expected_role = "user"
+                    for turn in convo:
+                        if isinstance(turn, dict) and "role" in turn:
+                            if turn["role"] == "user" and "content" in turn:
+                                valid_convo.append(turn)
+                                expected_role = "assistant"
+                            elif turn["role"] == "assistant" and "content" in turn:
+                                # Assistant turns can have both content and thinking
+                                valid_turn = {
+                                    "role": "assistant",
+                                    "content": turn.get("content", ""),
+                                    "thinking": turn.get("thinking", "")
+                                }
+                                valid_convo.append(valid_turn)
+                                expected_role = "user"
+                    loaded[chat_id] = valid_convo
+                conversations = loaded
+        except (json.JSONDecodeError, IOError) as e:
+            logging.warning(f"Could not load conversations.json: {e}")
             conversations = {}
     else:
         conversations = {}
 
 def save_conversations():
+    """Save conversations to disk"""
     with open(CONVERSATIONS_FILE, "w", encoding="utf-8") as f:
-        json.dump(conversations, f, ensure_ascii=False)
+        json.dump(conversations, f, ensure_ascii=False, indent=2)
 
-# ----------------------------------------------------
-# HELPER: ESCAPE MarkdownV2 (but allow "||" for spoilers)
-# ----------------------------------------------------
 def escape_markdown_v2(text: str) -> str:
     """
     Escapes Telegram MarkdownV2 special characters except '|',
-    so we can use ||spoiler||. If you want pipe symbols inside your text
-    to also be escaped, remove '|' from the logic below.
+    so we can use ||spoiler||.
     """
-    # Characters that must be escaped in MarkdownV2:
-    # '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '{', '}', '.', '!'
-    # We'll omit '|' from this list so the double-pipe spoiler syntax remains intact.
     escape_chars = r'_*[]()~`>#+-={}.!'
     for c in escape_chars:
         text = text.replace(c, "\\" + c)
@@ -98,68 +174,39 @@ async def set_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     MODEL_NAME = context.args[0]
     await update.message.reply_text(f"Model changed to: {MODEL_NAME}")
 
+async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Debug conversation structure"""
+    chat_id = str(update.effective_chat.id)
+    debug_conversation_structure(chat_id)
+    await update.message.reply_text("Debug info written to logs")
+
 # ----------------------------------------------------
 # MAIN MESSAGE HANDLER
 # ----------------------------------------------------
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    A more advanced approach:
-      1) Post "Thinking:" as Message #1 immediately.
-      2) Wait for tokens from Ollama. We maintain a small "state machine":
-         - "outsideThink" initially
-         - when we detect <think> we switch to "insideThink"
-         - when we detect </think> we switch to "afterThink"
-      3) As soon as we see <think>, create Message #2 for chain-of-thought spoilers,
-         update it in real-time with partial text.
-      4) After we see </think>, create Message #3 for normal text,
-         update it in real-time with partial text.
-      5) We chunk messages that exceed Telegram's limit.
-      6) Only at the very end do we finalize everything.
-    7) For conversation history, store only the user-facing text
-       (no <think>).
+    Main message handler with improved state machine and content separation
     """
     chat_id = str(update.effective_chat.id)
     user_text = update.message.text
 
-    # Retrieve or init conversation
     conversation = conversations.get(chat_id, [])
     conversation.append({"role": "user", "content": user_text})
 
-    # Build the prompt from entire conversation
-    prompt_text = "You are a helpful assistant.\n"
-    for turn in conversation:
-        if turn["role"] == "user":
-            prompt_text += f"User: {turn['content']}\n"
-        else:
-            prompt_text += f"Assistant: {turn['content']}\n"
-    prompt_text += "Assistant:"
-
-    # --------------------------
-    # 1) Immediately post "Thinking:" message
-    # --------------------------
+    prompt_text = build_prompt(conversation)
     thinking_header_msg = await update.message.reply_text("Thinking...")
 
-    # We'll create placeholders for the chain-of-thought message (#2) and the public message (#3).
     chain_of_thought_msg = None
     public_msg = None
 
-    # We maintain a small finite-state machine to track whether
-    # we are "outsideThink", "insideThink", or "afterThink".
-    # - "outsideThink": we haven't encountered <think> yet (all tokens here are public)
-    # - "insideThink": we are inside <think>...</think> (all tokens here are chain-of-thought)
-    # - "afterThink": we've encountered </think>, so everything else is public text afterwards
+    # Improved state machine
     state = "outsideThink"
-
-    # We'll store partial tokens in three buffers
-    outside_buffer = ""  # Accumulate text outside <think>
-    inside_buffer = ""   # Accumulate text inside <think>
-    after_buffer = ""    # Accumulate text after </think>
-
-    # This helps us do partial updates once we have a valid second or third message
-
+    outside_buffer = ""
+    inside_buffer = ""
+    after_buffer = ""
+    full_response = ""
     last_update_time = time.time()
 
-    # Prepare to stream from Ollama
     payload = {
         "prompt": prompt_text,
         "model": MODEL_NAME,
@@ -177,7 +224,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not line.strip():
                     continue
 
-                # Attempt to parse JSON chunk
                 try:
                     chunk = json.loads(line)
                 except json.JSONDecodeError:
@@ -187,181 +233,128 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 new_tokens = chunk["response"]
+                full_response += new_tokens
 
-                # We'll parse 'new_tokens' for <think> or </think> transitions
-                # Because these can arrive mid-chunk, we do a mini incremental parse:
+                # Improved token parsing logic
                 i = 0
                 while i < len(new_tokens):
                     if state == "outsideThink":
-                        # Look for "<think>"
                         idx = new_tokens.find("<think>", i)
                         if idx == -1:
-                            # No <think> in this substring
                             outside_buffer += new_tokens[i:]
-                            break
+                            i = len(new_tokens)
                         else:
-                            # Found <think>
-                            # Everything before <think> is outside text
                             outside_buffer += new_tokens[i:idx]
-                            # Switch state to "insideThink"
                             state = "insideThink"
-                            # We'll create the chain-of-thought message #2
                             if chain_of_thought_msg is None:
                                 chain_of_thought_msg = await update.effective_chat.send_message(
-                                    text="(Chain-of-thought spoilers start...)",
+                                    text=escape_markdown_v2("..."),
                                     parse_mode="MarkdownV2"
                                 )
                             i = idx + len("<think>")
 
                     elif state == "insideThink":
-                        # Look for "</think>"
                         end_idx = new_tokens.find("</think>", i)
                         if end_idx == -1:
-                            # Entire substring is still inside <think>
                             inside_buffer += new_tokens[i:]
-                            break
+                            i = len(new_tokens)
                         else:
-                            # Found closing tag
                             inside_buffer += new_tokens[i:end_idx]
-                            # Switch state to "afterThink"
                             state = "afterThink"
                             i = end_idx + len("</think>")
 
-                            # Now we create the public message #3
                             if public_msg is None:
                                 public_msg = await update.effective_chat.send_message(
-                                    text="(Public answer streaming...)"
+                                    text="..."
                                 )
 
                     elif state == "afterThink":
-                        # All tokens go to 'after_buffer'
-                        after_buffer += new_tokens[i:]
-                        break
+                        # Look for another <think> tag
+                        next_think = new_tokens.find("<think>", i)
+                        if next_think == -1:
+                            after_buffer += new_tokens[i:]
+                            i = len(new_tokens)
+                        else:
+                            after_buffer += new_tokens[i:next_think]
+                            state = "insideThink"
+                            i = next_think + len("<think>")
 
-                # End while
-                # We do partial updates if enough time has passed
+                # Partial updates with same timing
                 if time.time() - last_update_time > 0.7:
-                    # Update chain-of-thought if we're insideThink
-                    # or if we finished insideThink
-                    if chain_of_thought_msg is not None:
-                        # The entire inside_buffer is chain-of-thought
-                        # Escape for MarkdownV2 and wrap in spoilers
+                    # Update chain-of-thought
+                    if chain_of_thought_msg is not None and inside_buffer:
                         escaped = escape_markdown_v2(inside_buffer)
                         spoiler_text = f"||{escaped}||"
-                        # If it's > 4096, chunk it
                         cots_chunks = chunk_text(spoiler_text, TELEGRAM_MAX_LEN)
-                        # For partial updates, we just edit the last chunk in place
-                        # (It's advanced to do multiple messages mid-stream,
-                        # but let's keep it simpler: we only do partial
-                        # updates with the final chunk.)
                         try:
                             if len(cots_chunks) == 1:
                                 await chain_of_thought_msg.edit_text(
-                                    cots_chunks[0], parse_mode="MarkdownV2"
-                                )
-                            else:
-                                # We'll just show a note that it's too big
-                                # and post the final chunk for partial updates
-                                # (You can expand if you want)
-                                await chain_of_thought_msg.edit_text(
-                                    "(Chain-of-thought text too large, showing last chunk)",
+                                    cots_chunks[0],
                                     parse_mode="MarkdownV2"
                                 )
-                                await update.effective_chat.send_message(
-                                    cots_chunks[-1], parse_mode="MarkdownV2"
-                                )
-                        except:
-                            pass
+                        except Exception as e:
+                            logging.error(f"Error updating thinking: {e}")
 
-                    # Update public message if we are in "afterThink" or no <think> found yet
-                    # Actually, we show partial for outside_buffer only if we haven't encountered <think>?
-                    # But user wants the *third message* to appear only after <think> ends.
+                    # Update public message
                     if public_msg is not None:
-                        # We show after_buffer in public_msg
-                        pub_chunks = chunk_text(after_buffer)
-                        try:
-                            if len(pub_chunks) == 0:
-                                await public_msg.edit_text("(no public text yet)")
-                            elif len(pub_chunks) == 1:
-                                await public_msg.edit_text(pub_chunks[0])
-                            else:
-                                # same logic as chain-of-thought
-                                await public_msg.edit_text("(Public text is large, last chunk shown)")
-                                await update.effective_chat.send_message(pub_chunks[-1])
-                        except:
-                            pass
+                        current_public = outside_buffer + after_buffer
+                        if current_public.strip():
+                            try:
+                                await public_msg.edit_text(current_public)
+                            except Exception as e:
+                                logging.error(f"Error updating public: {e}")
 
                     last_update_time = time.time()
 
-            # End of streaming
     except requests.exceptions.RequestException as e:
         err_msg = f"Error connecting to Ollama:\n{e}"
         await thinking_header_msg.edit_text(err_msg)
         return
 
-    # -----------------------------------------------------------------
-    # FINISHED streaming. Do one final update for chain-of-thought and public text
-    # -----------------------------------------------------------------
-    # The final outside_buffer is text that occurred before <think>.
-    # The final inside_buffer is the chain-of-thought text.
-    # The final after_buffer is the public text after </think>.
+    # Clean up the response content
+    final_thinking = inside_buffer.strip()
+    final_public = (outside_buffer + after_buffer).strip()
 
-    # 2) chain-of-thought final update
-    if chain_of_thought_msg is not None:
-        # Escape and chunk
-        spoiler_text = f"||{escape_markdown_v2(inside_buffer)}||" if inside_buffer else "||(empty)||"
+    # Fix any lingering tags that might have leaked
+    final_public = re.sub(r'<think>.*?</think>', '', final_public, flags=re.DOTALL)
+    final_public = final_public.replace('<think>', '').replace('</think>', '')
+
+    # Store the cleaned-up response
+    if final_public or final_thinking:
+        conversation.append({
+            "role": "assistant",
+            "thinking": final_thinking,
+            "content": final_public
+        })
+        conversation = trim_conversation(conversation)
+        conversations[chat_id] = conversation
+        save_conversations()
+
+    # Final message updates
+    try:
+        await thinking_header_msg.delete()
+    except:
+        pass
+
+    if chain_of_thought_msg is not None and final_thinking:
+        spoiler_text = f"||{escape_markdown_v2(final_thinking)}||"
         cots_chunks = chunk_text(spoiler_text)
-        if len(cots_chunks) == 1:
-            try:
-                await chain_of_thought_msg.edit_text(cots_chunks[0], parse_mode="MarkdownV2")
-            except:
-                pass
-        else:
-            # Large chain-of-thought
-            try:
-                await chain_of_thought_msg.edit_text("(Final chain-of-thought is large, splitting...)",
-                                                     parse_mode="MarkdownV2")
-            except:
-                pass
-            for c in cots_chunks:
-                await update.effective_chat.send_message(c, parse_mode="MarkdownV2")
+        for i, chunk in enumerate(cots_chunks):
+            if i == 0:
+                await chain_of_thought_msg.edit_text(chunk, parse_mode="MarkdownV2")
+            else:
+                await update.effective_chat.send_message(chunk, parse_mode="MarkdownV2")
 
-    # 3) public text final update
-    # The "public" text is (outside_buffer + after_buffer) if you want everything
-    # that wasn't inside <think> to be displayed. Or just after_buffer if you only want
-    # the text that came *after* the chain-of-thought.
-    # Decide your logic. For simplicity, let's assume user wants final answer = outside_buffer + after_buffer
-    final_public = outside_buffer + after_buffer
-
-    if not final_public.strip():
-        final_public = "(no public text)"
-
-    if public_msg is None:
-        # Means we never encountered a complete <think> block
-        # so let's just post the final text as the "public" message
-        public_msg = await update.effective_chat.send_message("(Public answer finalizing...)")
-
-    # Split into chunks
-    pub_chunks = chunk_text(final_public)
-    if len(pub_chunks) == 1:
-        try:
-            await public_msg.edit_text(pub_chunks[0] if pub_chunks[0] else "(empty)")
-        except:
-            pass
-    else:
-        try:
-            await public_msg.edit_text("(Final text is large, splitting...)")
-        except:
-            pass
-        for c in pub_chunks:
-            await update.effective_chat.send_message(c if c else "(empty)")
-
-    # Finally, remove <think> from the conversation text, store only final_public
-    # so chain-of-thought won't feed back into the next prompt
-    conversation.append({"role": "assistant", "content": final_public})
-    conversations[chat_id] = conversation
-    save_conversations()
-
+    if final_public:
+        pub_chunks = chunk_text(final_public)
+        if public_msg is None:
+            public_msg = await update.effective_chat.send_message("...")
+        
+        for i, chunk in enumerate(pub_chunks):
+            if i == 0:
+                await public_msg.edit_text(chunk)
+            else:
+                await update.effective_chat.send_message(chunk)
 
 # ----------------------------------------------------
 # MAIN
@@ -373,8 +366,7 @@ if __name__ == "__main__":
 
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("set_model", set_model_command))
-    # Add more commands if you like
-
+    application.add_handler(CommandHandler("debug", debug_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     application.run_polling()
