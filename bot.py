@@ -3,9 +3,13 @@ import requests
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Replace 'YOUR_TELEGRAM_BOT_TOKEN' with your bot token
+# Replace with your actual Telegram bot token
 TELEGRAM_BOT_TOKEN = 'YOUR_TELEGRAM_BOT_TOKEN'
-OLLAMA_URL = 'http://localhost:11411/generate'  # The default Docker port for Ollama
+# Ollama API URL (assuming Docker exposes 11411)
+OLLAMA_URL = 'http://localhost:11411/generate'
+
+# Default model to use (from your `ollama list`)
+MODEL_NAME = "deepseek-r1:8b"   # 4.9 GB model
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -13,45 +17,72 @@ logging.basicConfig(
 )
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send a message when the command /start is issued."""
-    await update.message.reply_text('Hello! Send me a message, and I’ll ask Ollama!')
+    """Respond to /start command."""
+    await update.message.reply_text(
+        "Hello! Send me a message, and I'll query the local Ollama model for you.\n"
+        f"Currently using model: {MODEL_NAME}"
+    )
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle incoming text messages from the user."""
     user_message = update.message.text
 
-    # Call Ollama locally
-    # The prompt structure can be adjusted; below is a simple example
-    response = requests.post(
-        OLLAMA_URL,
-        headers={"Content-Type": "application/json"},
-        json={"prompt": user_message},
-        timeout=300  # Some models can take a while, so increase timeout if needed
-    )
+    # Call Ollama locally, specifying the model
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            headers={"Content-Type": "application/json"},
+            json={
+                "prompt": user_message,
+                # Here is the key field to specify your local model
+                "model": MODEL_NAME  
+            },
+            timeout=300  # Increase if needed for bigger models
+        )
+    except requests.exceptions.RequestException as e:
+        await update.message.reply_text(f"Error connecting to Ollama:\n{e}")
+        return
 
     if response.status_code == 200:
         data = response.json()
-        # 'data' is typically a JSON object or array; if the text is in 'data["done"]' or 'data["generated_text"]'
-        # the structure depends on which version of Ollama you have. Check the output to parse correctly.
-        # Below is a simplified approach if the response is just a JSON array of generation steps:
         generated_text = ""
+        # Ollama typically returns a list of chunks in the response
         for chunk in data:
-            # Each chunk typically has 'done': bool, 'response': partial text
+            # Each chunk often includes 'response' or partial text
             if 'response' in chunk:
                 generated_text += chunk['response']
-
-        # Send the final response to Telegram
+        # Send the final aggregated text to Telegram
         await update.message.reply_text(generated_text.strip())
     else:
-        await update.message.reply_text('Sorry, there was an error connecting to the local LLM.')
+        await update.message.reply_text(
+            f"Error {response.status_code} from Ollama: {response.text}"
+        )
+
+async def set_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Example optional command: /set_model <model_name>
+    Lets you switch to any model you have installed locally.
+    """
+    global MODEL_NAME
+    args = context.args
+
+    if not args:
+        await update.message.reply_text("Usage: /set_model <model_name>")
+        return
+
+    new_model = args[0]
+    MODEL_NAME = new_model
+    await update.message.reply_text(
+        f"Model changed to: {MODEL_NAME}\nNext requests will use this model."
+    )
 
 if __name__ == '__main__':
-    # Initialize Telegram application
     application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Add handlers
+    # Handlers
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("set_model", set_model_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Run the bot (this uses long-polling)
+    # Start long-polling
     application.run_polling()
