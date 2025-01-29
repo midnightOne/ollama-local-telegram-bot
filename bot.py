@@ -4,7 +4,10 @@ import os
 import requests
 import time
 import re
-
+import aiohttp
+import asyncio
+from typing import Optional
+from datetime import datetime
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -14,71 +17,87 @@ from telegram.ext import (
     ContextTypes
 )
 
-# ----------------- CONFIG & GLOBALS -----------------
-TELEGRAM_BOT_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-
-# Ollama endpoint
-OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
-
+OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 MODEL_NAME = "deepseek-r1:8b"
 CONVERSATIONS_FILE = "conversations.json"
 MAX_CONVERSATION_TURNS = 10
-
 # Telegram’s nominal max message length
 TELEGRAM_MAX_LEN = 4096
+UPDATE_INTERVAL = 1.2
 
+# Set up main logger
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO
 )
 
-# We’ll store conversation history in JSON on disk
+# Set up raw data logger
+raw_logger = logging.getLogger('raw_data')
+raw_logger.setLevel(logging.INFO)
+raw_handler = logging.FileHandler('raw_conversation_data.log')
+raw_handler.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
+raw_logger.addHandler(raw_handler)
+
 conversations = {}
 
-def debug_conversation_structure(chat_id):
-    """Helper function to debug conversation structure"""
-    if chat_id not in conversations:
-        logging.info(f"No conversation found for chat_id {chat_id}")
-        return
-        
-    convo = conversations[chat_id]
-    logging.info(f"Conversation length: {len(convo)} turns")
-    
-    for i, turn in enumerate(convo):
-        role = turn.get("role", "MISSING_ROLE")
-        if role == "user":
-            logging.info(f"Turn {i}: User message")
-        elif role == "assistant":
-            has_thinking = bool(turn.get("thinking"))
-            has_content = bool(turn.get("content"))
-            logging.info(f"Turn {i}: Assistant response (thinking: {has_thinking}, content: {has_content})")
-        else:
-            logging.info(f"Turn {i}: Invalid role: {role}")
+class MessageState:
+    def __init__(self):
+        self.last_thinking = ""
+        self.last_public = ""
 
 def build_prompt(conversation):
     """Build the prompt with clearer instructions about thinking tags"""
-    prompt_text = [
-        "You are a helpful assistant. Respond naturally to the user's messages.",
-        "Previous conversation:"
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant. Keep your thinking concise and focused on the current task. Use <think> tags only for current reasoning, not for recapping previous context."
+        }
     ]
     
-    for turn in conversation:
+    for turn in conversation[-6:]:
         if turn["role"] == "user":
-            prompt_text.append(f"User: {turn['content']}")
+            messages.append({
+                "role": "user", 
+                "content": turn["content"]
+            })
         else:
             # For assistant turns, reconstruct with thinking tags if present
             thinking = turn.get("thinking", "").strip()
             response = turn.get("content", "").strip()
-            
-            if thinking and response:
-                prompt_text.append(f"Assistant: <think>{thinking}</think>\n{response}")
-            elif thinking:
-                prompt_text.append(f"Assistant: <think>{thinking}</think>")
-            else:
-                prompt_text.append(f"Assistant: {response}")
+            content = f"<think>{thinking}</think>\n{response}" if thinking else response
+            messages.append({
+                "role": "assistant",
+                "content": content
+            })
     
-    prompt_text.append("Assistant:")
-    return "\n".join(prompt_text)
+    # For Ollama API
+    payload = {
+        "messages": messages,
+        "stream": True,
+        "options": {
+            "temperature": 0.7,
+            "top_p": 0.95,
+            "top_k": 40,
+            "num_predict": 1000
+        }
+    }
+    
+    return payload
+
+def escape_markdown_v2(text: str) -> str:
+    escape_chars = r'_*[]()~`>#+-={}.!'
+    for c in escape_chars:
+        text = text.replace(c, "\\" + c)
+    return text
+
+def chunk_text(text: str, max_len: int = TELEGRAM_MAX_LEN):
+    chunks = []
+    idx = 0
+    while idx < len(text):
+        end = idx + max_len
+        chunks.append(text[idx:end])
+        idx = end
+    return chunks
 
 def trim_conversation(conversation, max_turns=MAX_CONVERSATION_TURNS):
     """
@@ -133,40 +152,230 @@ def save_conversations():
     with open(CONVERSATIONS_FILE, "w", encoding="utf-8") as f:
         json.dump(conversations, f, ensure_ascii=False, indent=2)
 
-def escape_markdown_v2(text: str) -> str:
-    """
-    Escapes Telegram MarkdownV2 special characters except '|',
-    so we can use ||spoiler||.
-    """
-    escape_chars = r'_*[]()~`>#+-={}.!'
-    for c in escape_chars:
-        text = text.replace(c, "\\" + c)
-    return text
+async def update_messages(update, chain_of_thought_msg, public_msg, inside_buffer, outside_buffer, after_buffer):
+    if chain_of_thought_msg and inside_buffer:
+        escaped = escape_markdown_v2(inside_buffer)
+        spoiler_text = f"||{escaped}||"
+        chunks = chunk_text(spoiler_text, TELEGRAM_MAX_LEN)
+        try:
+            if len(chunks) == 1:
+                await chain_of_thought_msg.edit_text(chunks[0], parse_mode="MarkdownV2")
+            else:
+                await chain_of_thought_msg.edit_text(chunks[0], parse_mode="MarkdownV2")
+                for chunk in chunks[1:]:
+                    await update.effective_chat.send_message(chunk, parse_mode="MarkdownV2")
+        except Exception as e:
+            if "Message is not modified" not in str(e):
+                logging.error(f"Error updating thinking: {e}")
 
-def chunk_text(text: str, max_len: int = TELEGRAM_MAX_LEN):
-    """
-    Splits 'text' into a list of chunks up to 'max_len' characters each.
-    """
-    chunks = []
-    idx = 0
-    while idx < len(text):
-        end = idx + max_len
-        chunks.append(text[idx:end])
-        idx = end
-    return chunks
+    if public_msg:
+        current_public = outside_buffer + after_buffer
+        if current_public.strip():
+            chunks = chunk_text(current_public)
+            try:
+                if len(chunks) == 1:
+                    await public_msg.edit_text(chunks[0])
+                else:
+                    await public_msg.edit_text(chunks[0])
+                    for chunk in chunks[1:]:
+                        await update.effective_chat.send_message(chunk)
+            except Exception as e:
+                if "Message is not modified" not in str(e):
+                    logging.error(f"Error updating public: {e}")
+                    if "Message to edit not found" in str(e):
+                        try:
+                            public_msg = await update.effective_chat.send_message(current_public)
+                        except Exception as send_error:
+                            logging.error(f"Error sending new message: {send_error}")
 
 # ----------------------------------------------------
-# BOT COMMANDS
+# MAIN MESSAGE HANDLER
 # ----------------------------------------------------
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = str(update.effective_chat.id)
+    user_text = update.message.text
+
+    conversation = conversations.get(chat_id, [])
+    conversation.append({"role": "user", "content": user_text})
+
+    thinking_header_msg = await update.message.reply_text("Thinking...")
+
+    chain_of_thought_msg = None
+    public_msg = None
+    complete_response_received = False
+    
+    state = "outsideThink"
+    outside_buffer = ""
+    inside_buffer = ""
+    after_buffer = ""
+    full_response = ""
+    last_update_time = time.time()
+
+    payload = build_prompt(conversation[-6:])
+    payload["model"] = MODEL_NAME
+
+    # Log raw prompt
+    raw_logger.info(f"PAYLOAD [chat_id={chat_id}]:\n{json.dumps(payload, indent=2)}\n")
+
+    async def ensure_messages_sent():
+        nonlocal public_msg, chain_of_thought_msg
+        
+        if inside_buffer.strip():
+            if not chain_of_thought_msg:
+                try:
+                    escaped = escape_markdown_v2(inside_buffer)
+                    chain_of_thought_msg = await update.effective_chat.send_message(
+                        f"||{escaped}||",
+                        parse_mode="MarkdownV2"
+                    )
+                except Exception as e:
+                    logging.error(f"Error sending thinking message: {e}")
+
+        current_public = (outside_buffer + after_buffer).strip()
+        if current_public:
+            if not public_msg:
+                try:
+                    public_msg = await update.effective_chat.send_message(current_public)
+                except Exception as e:
+                    logging.error(f"Error sending public message: {e}")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(OLLAMA_URL, json=payload) as response:
+                if response.status != 200:
+                    err_text = f"Error {response.status} from Ollama:\n{await response.text()}"
+                    await thinking_header_msg.edit_text(err_text)
+                    return
+
+                buffer = ""
+                async for line in response.content:
+                    try:
+                        if not line.strip():
+                            continue
+                            
+                        buffer += line.decode('utf-8')
+                        if not buffer.endswith('\n'):
+                            continue
+                            
+                        for chunk_line in buffer.splitlines():
+                            if not chunk_line.strip():
+                                continue
+                                
+                            try:
+                                chunk = json.loads(chunk_line)
+                                # raw_logger.info(f"CHUNK:\n{json.dumps(chunk, indent=2)}\n")
+                            except json.JSONDecodeError:
+                                continue
+
+                            if "message" in chunk:
+                                new_tokens = chunk["message"]["content"]
+                            elif "response" in chunk:
+                                new_tokens = chunk["response"]
+                            else:
+                                continue
+
+                            full_response += new_tokens
+
+                            i = 0
+                            while i < len(new_tokens):
+                                if state == "outsideThink":
+                                    idx = new_tokens.find("<think>", i)
+                                    if idx == -1:
+                                        outside_buffer += new_tokens[i:]
+                                        i = len(new_tokens)
+                                    else:
+                                        outside_buffer += new_tokens[i:idx]
+                                        state = "insideThink"
+                                        i = idx + len("<think>")
+
+                                elif state == "insideThink":
+                                    end_idx = new_tokens.find("</think>", i)
+                                    if end_idx == -1:
+                                        inside_buffer += new_tokens[i:]
+                                        i = len(new_tokens)
+                                    else:
+                                        inside_buffer += new_tokens[i:end_idx]
+                                        state = "afterThink"
+                                        i = end_idx + len("</think>")
+
+                                else:
+                                    after_buffer += new_tokens[i:]
+                                    i = len(new_tokens)
+
+                            if time.time() - last_update_time > UPDATE_INTERVAL:
+                                await ensure_messages_sent()
+                                await update_messages(
+                                    update,
+                                    chain_of_thought_msg,
+                                    public_msg,
+                                    inside_buffer,
+                                    outside_buffer,
+                                    after_buffer
+                                )
+                                last_update_time = time.time()
+                                
+                        buffer = ""
+
+                    except Exception as e:
+                        raw_logger.error(f"Error processing chunk: {str(e)}\nChunk: {chunk_line}")
+                        continue
+
+                complete_response_received = True
+
+    except Exception as e:
+        logging.error(f"Error in handle_message: {str(e)}")
+        await thinking_header_msg.edit_text(f"Error: {str(e)}")
+        return
+
+    # Log raw response
+    raw_logger.info(f"RESPONSE [chat_id={chat_id}]:\n{full_response}\n")
+
+    try:
+        await ensure_messages_sent()
+        
+        retry_count = 3
+        for attempt in range(retry_count):
+            try:
+                await update_messages(
+                    update,
+                    chain_of_thought_msg,
+                    public_msg,
+                    inside_buffer,
+                    outside_buffer,
+                    after_buffer
+                )
+                break
+            except Exception as e:
+                if attempt == retry_count - 1:
+                    logging.error(f"Final update failed after {retry_count} attempts: {e}")
+                await asyncio.sleep(0.5)
+
+    except Exception as e:
+        logging.error(f"Error in final message handling: {e}")
+
+    if complete_response_received:
+        final_content = (outside_buffer + after_buffer).strip()
+        if final_content or inside_buffer.strip():
+            conversation.append({
+                "role": "assistant",
+                "thinking": inside_buffer.strip(),
+                "content": final_content
+            })
+            conversations[chat_id] = conversation
+            save_conversations()
+
+    try:
+        await thinking_header_msg.delete()
+    except Exception:
+        pass
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Clears conversation for this chat."""
     chat_id = str(update.effective_chat.id)
     conversations[chat_id] = []
     save_conversations()
     await update.message.reply_text("Conversation reset. Let's start fresh!")
 
 async def set_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Switch models with /set_model <model_name>."""
     global MODEL_NAME
     if not context.args:
         await update.message.reply_text("Usage: /set_model <model_name>")
@@ -175,190 +384,29 @@ async def set_model_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Model changed to: {MODEL_NAME}")
 
 async def debug_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Debug conversation structure"""
     chat_id = str(update.effective_chat.id)
     debug_conversation_structure(chat_id)
     await update.message.reply_text("Debug info written to logs")
 
-# ----------------------------------------------------
-# MAIN MESSAGE HANDLER
-# ----------------------------------------------------
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Main message handler with improved state machine and content separation
-    """
-    chat_id = str(update.effective_chat.id)
-    user_text = update.message.text
-
-    conversation = conversations.get(chat_id, [])
-    conversation.append({"role": "user", "content": user_text})
-
-    prompt_text = build_prompt(conversation)
-    thinking_header_msg = await update.message.reply_text("Thinking...")
-
-    chain_of_thought_msg = None
-    public_msg = None
-
-    # Improved state machine
-    state = "outsideThink"
-    outside_buffer = ""
-    inside_buffer = ""
-    after_buffer = ""
-    full_response = ""
-    last_update_time = time.time()
-
-    payload = {
-        "prompt": prompt_text,
-        "model": MODEL_NAME,
-        "stream": True
-    }
-
-    try:
-        with requests.post(OLLAMA_URL, json=payload, stream=True) as response:
-            if response.status_code != 200:
-                err_text = f"Error {response.status_code} from Ollama:\n{response.text}"
-                await thinking_header_msg.edit_text(err_text)
-                return
-
-            for line in response.iter_lines(decode_unicode=True):
-                if not line.strip():
-                    continue
-
-                try:
-                    chunk = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                if "response" not in chunk:
-                    continue
-
-                new_tokens = chunk["response"]
-                full_response += new_tokens
-
-                # Improved token parsing logic
-                i = 0
-                while i < len(new_tokens):
-                    if state == "outsideThink":
-                        idx = new_tokens.find("<think>", i)
-                        if idx == -1:
-                            outside_buffer += new_tokens[i:]
-                            i = len(new_tokens)
-                        else:
-                            outside_buffer += new_tokens[i:idx]
-                            state = "insideThink"
-                            if chain_of_thought_msg is None:
-                                chain_of_thought_msg = await update.effective_chat.send_message(
-                                    text=escape_markdown_v2("..."),
-                                    parse_mode="MarkdownV2"
-                                )
-                            i = idx + len("<think>")
-
-                    elif state == "insideThink":
-                        end_idx = new_tokens.find("</think>", i)
-                        if end_idx == -1:
-                            inside_buffer += new_tokens[i:]
-                            i = len(new_tokens)
-                        else:
-                            inside_buffer += new_tokens[i:end_idx]
-                            state = "afterThink"
-                            i = end_idx + len("</think>")
-
-                            if public_msg is None:
-                                public_msg = await update.effective_chat.send_message(
-                                    text="..."
-                                )
-
-                    elif state == "afterThink":
-                        # Look for another <think> tag
-                        next_think = new_tokens.find("<think>", i)
-                        if next_think == -1:
-                            after_buffer += new_tokens[i:]
-                            i = len(new_tokens)
-                        else:
-                            after_buffer += new_tokens[i:next_think]
-                            state = "insideThink"
-                            i = next_think + len("<think>")
-
-                # Partial updates with same timing
-                if time.time() - last_update_time > 0.7:
-                    # Update chain-of-thought
-                    if chain_of_thought_msg is not None and inside_buffer:
-                        escaped = escape_markdown_v2(inside_buffer)
-                        spoiler_text = f"||{escaped}||"
-                        cots_chunks = chunk_text(spoiler_text, TELEGRAM_MAX_LEN)
-                        try:
-                            if len(cots_chunks) == 1:
-                                await chain_of_thought_msg.edit_text(
-                                    cots_chunks[0],
-                                    parse_mode="MarkdownV2"
-                                )
-                        except Exception as e:
-                            logging.error(f"Error updating thinking: {e}")
-
-                    # Update public message
-                    if public_msg is not None:
-                        current_public = outside_buffer + after_buffer
-                        if current_public.strip():
-                            try:
-                                await public_msg.edit_text(current_public)
-                            except Exception as e:
-                                logging.error(f"Error updating public: {e}")
-
-                    last_update_time = time.time()
-
-    except requests.exceptions.RequestException as e:
-        err_msg = f"Error connecting to Ollama:\n{e}"
-        await thinking_header_msg.edit_text(err_msg)
+def debug_conversation_structure(chat_id):
+    if chat_id not in conversations:
+        logging.info(f"No conversation found for chat_id {chat_id}")
         return
-
-    # Clean up the response content
-    final_thinking = inside_buffer.strip()
-    final_public = (outside_buffer + after_buffer).strip()
-
-    # Fix any lingering tags that might have leaked
-    final_public = re.sub(r'<think>.*?</think>', '', final_public, flags=re.DOTALL)
-    final_public = final_public.replace('<think>', '').replace('</think>', '')
-
-    # Store the cleaned-up response
-    if final_public or final_thinking:
-        conversation.append({
-            "role": "assistant",
-            "thinking": final_thinking,
-            "content": final_public
-        })
-        conversation = trim_conversation(conversation)
-        conversations[chat_id] = conversation
-        save_conversations()
-
-    # Final message updates
-    try:
-        await thinking_header_msg.delete()
-    except:
-        pass
-
-    if chain_of_thought_msg is not None and final_thinking:
-        spoiler_text = f"||{escape_markdown_v2(final_thinking)}||"
-        cots_chunks = chunk_text(spoiler_text)
-        for i, chunk in enumerate(cots_chunks):
-            if i == 0:
-                await chain_of_thought_msg.edit_text(chunk, parse_mode="MarkdownV2")
-            else:
-                await update.effective_chat.send_message(chunk, parse_mode="MarkdownV2")
-
-    if final_public:
-        pub_chunks = chunk_text(final_public)
-        if public_msg is None:
-            public_msg = await update.effective_chat.send_message("...")
         
-        for i, chunk in enumerate(pub_chunks):
-            if i == 0:
-                await public_msg.edit_text(chunk)
-            else:
-                await update.effective_chat.send_message(chunk)
+    convo = conversations[chat_id]
+    logging.info(f"Conversation length: {len(convo)} turns")
+    
+    for i, turn in enumerate(convo):
+        role = turn.get("role", "MISSING_ROLE")
+        if role == "user":
+            logging.info(f"Turn {i}: User message")
+        elif role == "assistant":
+            has_thinking = bool(turn.get("thinking"))
+            has_content = bool(turn.get("content"))
+            logging.info(f"Turn {i}: Assistant response (thinking: {has_thinking}, content: {has_content})")
+        else:
+            logging.info(f"Turn {i}: Invalid role: {role}")
 
-# ----------------------------------------------------
-# MAIN
-# ----------------------------------------------------
 if __name__ == "__main__":
     load_conversations()
 
